@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+# pass extension: bitcoind - Bitcoin wallet backup/restore for pass
+# Version: 0.2.2
+# License: MIT
+#
+# Installation: Copy this script to ~/.password-store/.extensions/bitcoind.bash
+# Usage: pass bitcoind [create|backup|restore|destroy|list|import|export] <wallet-name> [options]
+
+set -euo pipefail
+
+# Set secure umask - ensure all created files are owner-only
+umask 077
+
+# Constants
+readonly VERSION="0.2.2" # Updated version
+readonly WALLET_PREFIX="${PASS_BITCOIND_PREFIX:-bitcoind}"
+readonly SECURE_TEMP_DIR="${TMPDIR:-/tmp}"
+
+# Use memory-mapped storage if available for better security
+if [[ -d "/dev/shm" ]] && [[ -w "/dev/shm" ]]; then
+    readonly TEMP_DIR="/dev/shm"
+else
+    readonly TEMP_DIR="$SECURE_TEMP_DIR"
+fi
+
+# Colors
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m'
+
+# Logging
+log_error() { printf "${RED}Error: %s${NC}\n" "$*" >&2; }
+log_warning() { printf "${YELLOW}Warning: %s${NC}\n" "$*" >&2; }
+log_success() { printf "${GREEN}%s${NC}\n" "$*"; }
+
+# Trap for cleanup
+declare -a TEMP_FILES_TO_CLEANUP
+TEMP_FILES_TO_CLEANUP=() # Initialize the array
+_cleanup_temp_files() {
+    if [[ -v TEMP_FILES_TO_CLEANUP && ${#TEMP_FILES_TO_CLEANUP[@]} -gt 0 ]]; then
+        # log_warning "Cleaning up temporary files..." # Uncomment for debugging
+        for temp_file in "${TEMP_FILES_TO_CLEANUP[@]}"; do
+            if [[ -e "$temp_file" ]]; then # Check if file still exists
+                if command -v shred >/dev/null 2>&1; then
+                    shred -vfz -n 3 "$temp_file" 2>/dev/null || true
+                elif [[ -e /dev/urandom ]]; then
+                    dd if=/dev/urandom of="$temp_file" bs=1024 count=1 2>/dev/null || true
+                fi
+                rm -f "$temp_file"
+            fi
+        done
+    fi
+}
+trap _cleanup_temp_files EXIT INT TERM
+
+
+# Security helper functions
+create_secure_temp() {
+    local temp_file
+    temp_file=$(mktemp -p "$TEMP_DIR" "btc-secure.XXXXXX")
+    chmod 600 "$temp_file"
+    TEMP_FILES_TO_CLEANUP+=("$temp_file")
+    echo "$temp_file"
+}
+
+secure_cleanup() {
+    local file_to_clean="$1"
+    if [[ -f "$file_to_clean" ]]; then
+        if command -v shred >/dev/null 2>&1; then
+            shred -vfz -n 3 "$file_to_clean" 2>/dev/null || true
+        elif [[ -e /dev/urandom ]]; then
+            dd if=/dev/urandom of="$file_to_clean" bs=1024 count=1 2>/dev/null || true
+        fi
+        rm -f "$file_to_clean"
+    fi
+    for i in "${!TEMP_FILES_TO_CLEANUP[@]}"; do
+        if [[ "${TEMP_FILES_TO_CLEANUP[$i]}" == "$file_to_clean" ]]; then
+            unset 'TEMP_FILES_TO_CLEANUP[i]'
+            TEMP_FILES_TO_CLEANUP=("${TEMP_FILES_TO_CLEANUP[@]}") # Re-index
+            break
+        fi
+    done
+}
+
+get_wallet_pass_path() {
+    echo "${WALLET_PREFIX}/$1"
+}
+
+check_wallet_balance() {
+    local wallet_name="$1"
+    local balance
+    if balance=$(bitcoin-cli -rpcwallet="$wallet_name" getbalance 2>/dev/null); then
+        if command -v bc >/dev/null 2>&1; then
+            if [[ "$balance" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                if (( $(echo "$balance > 0" | bc -l 2>/dev/null || echo "0") )); then
+                    log_warning "Wallet '$wallet_name' contains $balance BTC"
+                    log_warning "Ensure secure backup storage!"
+                fi
+            else
+                 log_warning "Could not parse wallet balance ('$balance') for '$wallet_name' for comparison."
+            fi
+        fi
+    fi
+}
+
+verify_backup() {
+    local wallet_path="$1"
+    local temp_verify
+    temp_verify=$(create_secure_temp)
+
+    if ! pass show "$wallet_path" > "$temp_verify" 2>/dev/null; then
+        log_error "Backup verification failed - cannot retrieve from pass at '$wallet_path'"
+        secure_cleanup "$temp_verify"
+        return 1
+    fi
+
+    if ! jq -e '.descriptors.descriptors | length > 0' "$temp_verify" >/dev/null 2>&1; then
+        log_error "Backup verification failed - no descriptors found in backup at '$wallet_path'"
+        secure_cleanup "$temp_verify"
+        return 1
+    fi
+
+    secure_cleanup "$temp_verify"
+    return 0
+}
+
+check_deps() {
+    local dep_missing=0
+    if ! command -v pass >/dev/null 2>&1; then log_error "pass is required but not found"; dep_missing=1; fi
+    if ! command -v jq >/dev/null 2>&1; then log_error "jq is required but not found"; dep_missing=1; fi
+    if ! command -v bitcoin-cli >/dev/null 2>&1; then log_error "bitcoin-cli is required but not found"; dep_missing=1; fi
+    if (( dep_missing )); then exit 1; fi
+
+    if ! bitcoin-cli getblockchaininfo >/dev/null 2>&1; then
+        log_error "Bitcoin Core is not running or not accessible"
+        exit 1
+    fi
+    if ! command -v bc >/dev/null 2>&1; then
+        log_warning "bc not found - wallet balance warnings may not work properly"
+    fi
+}
+
+create_wallet() {
+    local wallet_name="$1"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+
+    validate_wallet_name "$wallet_name"
+
+    if pass show "$wallet_path" >/dev/null 2>&1; then
+        log_error "Wallet '$wallet_name' already exists in pass at '$wallet_path'"
+        exit 1
+    fi
+
+    if bitcoin-cli listwallets | jq -e ".[] | select(.name == \"$wallet_name\")" >/dev/null 2>&1; then
+        log_error "Wallet '$wallet_name' already exists in Bitcoin Core"
+        exit 1
+    fi
+
+    echo "Creating new Bitcoin Core wallet '$wallet_name'..."
+    if ! bitcoin-cli createwallet "$wallet_name" false false "" false true false >/dev/null 2>&1; then
+        log_error "Failed to create wallet '$wallet_name' in Bitcoin Core"
+        exit 1
+    fi
+
+    echo "Backing up wallet to pass..."
+    if ! backup_wallet_to_pass "$wallet_name"; then
+        log_error "Failed to backup newly created wallet '$wallet_name'. Attempting to unload from Bitcoin Core."
+        bitcoin-cli unloadwallet "$wallet_name" >/dev/null 2>&1 || log_warning "Could not unload wallet '$wallet_name' from Bitcoin Core after failed backup."
+        exit 1
+    fi
+
+    log_success "Wallet '$wallet_name' created and backed up successfully!"
+    echo "Pass Location: $wallet_path"
+    echo "Bitcoin Core wallet name: $wallet_name"
+}
+
+backup_wallet() {
+    local wallet_name="$1"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+
+    validate_wallet_name "$wallet_name"
+
+    if ! bitcoin-cli listwallets | jq -e ".[] | select(.name == \"$wallet_name\")" >/dev/null 2>&1; then
+        log_error "Wallet '$wallet_name' not found in Bitcoin Core"
+        exit 1
+    fi
+
+    echo "Backing up wallet '$wallet_name' to pass..."
+    if ! backup_wallet_to_pass "$wallet_name"; then
+        exit 1
+    fi
+
+    log_success "Wallet '$wallet_name' backed up successfully!"
+    echo "Pass Location: $wallet_path"
+}
+
+backup_wallet_to_pass() {
+    local wallet_name="$1"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+    local temp_json
+    temp_json=$(create_secure_temp)
+
+    check_wallet_balance "$wallet_name"
+
+    local wallet_info
+    if ! wallet_info=$(bitcoin-cli -rpcwallet="$wallet_name" getwalletinfo 2>/dev/null); then
+        log_error "Failed to get wallet info for '$wallet_name' from Bitcoin Core"
+        return 1
+    fi
+
+    local descriptors
+    if ! descriptors=$(bitcoin-cli -rpcwallet="$wallet_name" listdescriptors true 2>/dev/null); then
+        log_error "Failed to export wallet descriptors for '$wallet_name' from Bitcoin Core"
+        return 1
+    fi
+
+    local backup_data
+    backup_data=$(jq -n \
+        --arg version "$VERSION" \
+        --arg name "$wallet_name" \
+        --argjson timestamp "$(date +%s)" \
+        --argjson wallet_info "$wallet_info" \
+        --argjson descriptors "$descriptors" \
+        '{
+            version: $version,
+            wallet_name: $name,
+            timestamp: $timestamp,
+            wallet_info: $wallet_info,
+            descriptors: $descriptors
+        }')
+
+    if ! echo "$backup_data" > "$temp_json"; then
+        log_error "Failed to write wallet backup data to temporary file for '$wallet_name'"
+        return 1
+    fi
+
+    if ! pass insert -f -m "$wallet_path" < "$temp_json" >/dev/null; then
+        log_error "Failed to store wallet backup in pass at '$wallet_path'"
+        return 1
+    fi
+    secure_cleanup "$temp_json" # Clean up temp_json as it's no longer needed here
+
+    if ! verify_backup "$wallet_path"; then
+        log_error "Backup verification failed for '$wallet_path'. The backup in pass might be corrupted."
+        printf "Warning: Attempting to remove potentially corrupted backup from pass: %s\n" "$wallet_path"
+        pass rm --force "$wallet_path" >/dev/null 2>&1 || log_warning "Could not remove corrupted backup $wallet_path from pass."
+        return 1
+    fi
+    return 0
+}
+
+restore_wallet() {
+    local wallet_name="$1"
+    local new_wallet_name="${2:-$wallet_name}"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+
+    validate_wallet_name "$wallet_name"
+    validate_wallet_name "$new_wallet_name"
+
+    if ! pass show "$wallet_path" >/dev/null 2>&1; then
+        log_error "Wallet backup '$wallet_name' not found in pass at '$wallet_path'"
+        exit 1
+    fi
+
+    if bitcoin-cli listwallets | jq -e ".[] | select(.name == \"$new_wallet_name\")" >/dev/null 2>&1; then
+        log_error "Target wallet '$new_wallet_name' already exists in Bitcoin Core"
+        exit 1
+    fi
+
+    echo "Restoring wallet '$wallet_name' from pass as '$new_wallet_name' in Bitcoin Core..."
+    local temp_json
+    temp_json=$(create_secure_temp)
+
+    if ! pass show "$wallet_path" > "$temp_json"; then
+        log_error "Failed to retrieve wallet backup from pass at '$wallet_path'"
+        exit 1
+    fi
+
+    local descriptors_data
+    if ! descriptors_data=$(jq -r '.descriptors.descriptors' "$temp_json" 2>/dev/null); then
+        log_error "Failed to parse wallet backup data from '$wallet_path'"
+        exit 1
+    fi
+
+    if [[ "$descriptors_data" == "null" || -z "$descriptors_data" ]]; then
+        log_error "No descriptors found in wallet backup '$wallet_path'"
+        exit 1
+    fi
+
+    if ! bitcoin-cli createwallet "$new_wallet_name" false false "" false true false >/dev/null 2>&1; then
+        log_error "Failed to create empty wallet '$new_wallet_name' in Bitcoin Core"
+        exit 1
+    fi
+
+    local import_descriptors
+    import_descriptors=$(echo "$descriptors_data" | jq '[.[] | {
+        desc: .desc,
+        active: .active,
+        internal: .internal,
+        timestamp: .timestamp,
+        range: .range,
+        next_index: .next
+    }]')
+
+    local import_json_payload
+    import_json_payload=$(echo "$import_descriptors" | jq -c .)
+
+    if ! bitcoin-cli -rpcwallet="$new_wallet_name" importdescriptors "$import_json_payload" >/dev/null 2>&1; then
+        log_error "Failed to import descriptors to wallet '$new_wallet_name'"
+        log_warning "Attempting to unload partially created wallet '$new_wallet_name' from Bitcoin Core..."
+        bitcoin-cli unloadwallet "$new_wallet_name" >/dev/null 2>&1 || log_warning "Could not unload wallet '$new_wallet_name'."
+        exit 1
+    fi
+
+    secure_cleanup "$temp_json"
+
+    log_success "Wallet '$wallet_name' restored as '$new_wallet_name' successfully!"
+    echo "Note: Wallet rescan may take some time in the background."
+}
+
+import_wallet() {
+    local wallet_name="$1"
+    local json_file="$2"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+
+    validate_wallet_name "$wallet_name"
+
+    if [[ ! -f "$json_file" ]]; then log_error "Wallet file '$json_file' not found"; exit 1; fi
+    if [[ ! -r "$json_file" ]]; then log_error "Wallet file '$json_file' is not readable"; exit 1; fi
+
+    if pass show "$wallet_path" >/dev/null 2>&1; then
+        log_error "Wallet '$wallet_name' already exists in pass at '$wallet_path'"
+        exit 1
+    fi
+
+    if ! jq empty < "$json_file" 2>/dev/null; then
+        log_error "Invalid JSON format in wallet file '$json_file'"
+        exit 1
+    fi
+
+    if ! jq -e '.descriptors.descriptors | length > 0' < "$json_file" >/dev/null 2>&1; then
+        log_error "Wallet file '$json_file' missing required descriptors data or descriptors array is empty"
+        exit 1
+    fi
+
+    echo "Importing wallet file '$json_file' as '$wallet_name' to pass..."
+    if ! pass insert -f -m "$wallet_path" < "$json_file" >/dev/null; then
+        log_error "Failed to store wallet in pass at '$wallet_path'"
+        exit 1
+    fi
+
+    if ! verify_backup "$wallet_path"; then
+        log_error "Imported wallet verification failed for '$wallet_path'. The import might be corrupted or incomplete."
+        printf "Warning: Attempting to remove potentially problematic import from pass: %s\n" "$wallet_path"
+        pass rm --force "$wallet_path" >/dev/null 2>&1 || log_warning "Could not remove problematic import $wallet_path from pass."
+        exit 1
+    fi
+
+    log_success "Wallet file imported as '$wallet_name' successfully!"
+    echo "Pass Location: $wallet_path"
+}
+
+export_wallet() {
+    local wallet_name="$1"
+    local output_file="$2"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+
+    validate_wallet_name "$wallet_name"
+
+    if ! pass show "$wallet_path" >/dev/null 2>&1; then
+        log_error "Wallet backup '$wallet_name' not found in pass at '$wallet_path'"
+        exit 1
+    fi
+
+    if [[ -e "$output_file" ]]; then
+        log_error "Output file '$output_file' already exists. Please choose a different name or remove it."
+        exit 1
+    fi
+
+    echo "Exporting wallet '$wallet_name' from pass to '$output_file'..."
+    touch "$output_file"
+    chmod 600 "$output_file"
+
+    if ! pass show "$wallet_path" > "$output_file"; then
+        log_error "Failed to export wallet from pass to '$output_file'"
+        rm -f "$output_file"
+        exit 1
+    fi
+
+    if ! jq -e '.descriptors.descriptors | length > 0' "$output_file" >/dev/null 2>&1; then
+        log_error "Exported file '$output_file' appears to be corrupted or missing descriptors."
+        rm -f "$output_file"
+        exit 1
+    fi
+
+    log_success "Wallet '$wallet_name' exported to '$output_file' successfully!"
+}
+
+destroy_wallet() {
+    local wallet_name="$1"
+    local wallet_path
+    wallet_path=$(get_wallet_pass_path "$wallet_name")
+
+    validate_wallet_name "$wallet_name"
+
+    local found_in_pass=false
+    local found_in_btc=false
+
+    if pass show "$wallet_path" >/dev/null 2>&1; then found_in_pass=true; fi
+    if bitcoin-cli listwallets | jq -e ".[] | select(.name == \"$wallet_name\")" >/dev/null 2>&1; then found_in_btc=true; fi
+
+    if [[ "$found_in_pass" == false && "$found_in_btc" == false ]]; then
+        log_error "Wallet '$wallet_name' not found in pass (at '$wallet_path') or Bitcoin Core"
+        exit 1
+    fi
+
+    log_warning "This will permanently delete wallet '$wallet_name' data."
+    if [[ "$found_in_pass" == true ]]; then log_warning " - Backup in pass at '$wallet_path' will be removed."; fi
+    if [[ "$found_in_btc" == true ]]; then
+        log_warning " - Wallet in Bitcoin Core will be unloaded."
+        log_warning "   (Wallet directory on disk might need manual removal, check Bitcoin Core docs)."
+    fi
+    printf "Are you sure you want to proceed? [y/N] "
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then echo "Operation cancelled."; exit 0; fi
+
+    if [[ "$found_in_btc" == true ]]; then
+        echo "Unloading wallet '$wallet_name' from Bitcoin Core..."
+        if ! bitcoin-cli unloadwallet "$wallet_name" >/dev/null 2>&1; then
+            log_warning "Failed to unload wallet '$wallet_name' from Bitcoin Core. It might be in use or not loaded."
+        else
+            log_success "Wallet '$wallet_name' unloaded from Bitcoin Core."
+        fi
+    fi
+
+    if [[ "$found_in_pass" == true ]]; then
+        echo "Removing wallet backup from pass '$wallet_path'..."
+        if ! pass rm --force "$wallet_path" >/dev/null; then
+            log_error "Failed to remove wallet backup from pass at '$wallet_path'."
+        else
+            log_success "Wallet backup '$wallet_path' removed from pass."
+        fi
+    fi
+
+    log_success "Wallet '$wallet_name' destruction process complete."
+}
+
+list_wallets() {
+    echo -e "${BLUE}Wallets stored in pass (under ${WALLET_PREFIX}/):${NC}"
+    local pass_dir_path="${PASS_DIR:-$HOME/.password-store}/${WALLET_PREFIX}"
+    local found_pass_wallets=0
+    if [[ -d "$pass_dir_path" ]]; then
+        # Using a loop and a flag to correctly print "No wallets found"
+        while IFS= read -r -d $'\0' entry; do
+            basename "$entry" .gpg
+            found_pass_wallets=1
+        done < <(find "$pass_dir_path" -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null | sort -z) # sort -z for null-terminated
+
+        if (( ! found_pass_wallets )); then
+             echo "No wallets found in pass under '$WALLET_PREFIX'."
+        fi
+    else
+        echo "Pass storage directory for '$WALLET_PREFIX' not found or is not a directory."
+    fi
+
+    echo ""
+    echo -e "${BLUE}Wallets loaded in Bitcoin Core:${NC}"
+    local core_wallets
+    core_wallets=$(bitcoin-cli listwallets 2>/dev/null | jq -r '.[]? | .name' 2>/dev/null || true)
+    if [[ -z "$core_wallets" ]]; then
+        echo "No wallets loaded in Bitcoin Core or unable to query."
+    else
+        echo "$core_wallets"
+    fi
+}
+
+usage() {
+    cat << EOF
+pass-bitcoind ${VERSION}: Bitcoin wallet backup/restore for pass
+
+DESCRIPTION:
+  A pass extension that provides Bitcoin Core wallet backup and restore
+  functionality using JSON descriptor export/import.
+
+USAGE:
+  pass bitcoind create <wallet-name>              Create new wallet and backup to pass
+  pass bitcoind backup <wallet-name>              Backup existing Bitcoin Core wallet to pass
+  pass bitcoind restore <wallet-name> [new-name]  Restore wallet from pass to Bitcoin Core
+  pass bitcoind import <wallet-name> <json-file>  Import wallet JSON file to pass
+  pass bitcoind export <wallet_name> <json_file>  Export wallet from pass to JSON file
+  pass bitcoind destroy <wallet-name>             Remove wallet from pass and Bitcoin Core
+  pass bitcoind list                              List wallets in pass and Bitcoin Core
+  pass bitcoind help                              Show this help
+
+INSTALLATION:
+  mkdir -p ~/.password-store/.extensions
+  cp bitcoind.bash ~/.password-store/.extensions/bitcoind.bash
+  chmod +x ~/.password-store/.extensions/bitcoind.bash
+
+ENVIRONMENT VARIABLES:
+  PASS_BITCOIND_PREFIX    Change wallet storage prefix (default: ${WALLET_PREFIX})
+
+REQUIREMENTS:
+  - Bitcoin Core (bitcoind) must be running and accessible via bitcoin-cli
+  - pass password manager must be installed and initialized
+  - jq command must be available for JSON parsing
+  - bc command (optional, for balance warnings)
+
+WORKFLOW:
+  1. CREATE: Bitcoin Core wallet → listdescriptors (with private keys) → JSON → pass storage
+  2. RESTORE: pass storage → JSON descriptors → importdescriptors → Bitcoin Core wallet
+
+STORAGE FORMAT:
+  Wallets are stored in pass as JSON containing wallet descriptors and metadata at:
+  ${WALLET_PREFIX}/<wallet-name>
+EOF
+    exit "${1:-0}"
+}
+
+validate_wallet_name() {
+    local name="$1"
+    if [[ -z "$name" ]]; then log_error "Wallet name cannot be empty"; exit 1; fi
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "Invalid wallet name: '$name'. Use only alphanumeric, underscore, hyphen, or dot."
+        exit 1
+    fi
+    if [[ "$name" == "." || "$name" == ".." ]]; then
+        log_error "Wallet name cannot be '.' or '..'"
+        exit 1
+    fi
+}
+
+check_deps
+
+case "${1:-help}" in
+    help|--help|-h) usage 0 ;;
+    create)  if [[ $# -ne 2 ]]; then log_error "Usage: pass bitcoind create <wallet-name>"; usage 1; fi; create_wallet "$2" ;;
+    backup)  if [[ $# -ne 2 ]]; then log_error "Usage: pass bitcoind backup <wallet-name>"; usage 1; fi; backup_wallet "$2" ;;
+    restore) if [[ $# -lt 2 || $# -gt 3 ]]; then log_error "Usage: pass bitcoind restore <wallet-name> [new-name]"; usage 1; fi; restore_wallet "$2" "${3:-$2}" ;;
+    import)  if [[ $# -ne 3 ]]; then log_error "Usage: pass bitcoind import <wallet-name> <json-file>"; usage 1; fi; import_wallet "$2" "$3" ;;
+    export)  if [[ $# -ne 3 ]]; then log_error "Usage: pass bitcoind export <wallet-name> <json-file>"; usage 1; fi; export_wallet "$2" "$3" ;;
+    destroy) if [[ $# -ne 2 ]]; then log_error "Usage: pass bitcoind destroy <wallet-name>"; usage 1; fi; destroy_wallet "$2" ;;
+    list)    if [[ $# -ne 1 ]]; then log_error "Usage: pass bitcoind list"; usage 1; fi; list_wallets ;;
+    *) log_error "Unknown command: $1"; usage 1 ;;
+esac
