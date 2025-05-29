@@ -1,0 +1,20 @@
+# macOS system files
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor backup and swap files (general good practice)
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# VS Code
+.vscode/
+
+# Pass store (crucial if ever present locally in repo dir)
+.password-store/
