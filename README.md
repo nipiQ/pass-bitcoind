@@ -1,4 +1,5 @@
-![pass-bitcoind](banner.webp)
+<p align="center"><img alt="Pass Bitcoin Core extension banner" title="A pass CLI extension for Bitcoin Core wallet backup and restore." src="https://raw.githubusercontent.com/nipiQ/.github/main/assets/pass-bitcoind-repo-banner.webp" width="100%">
+</p>
 
 # pass-bitcoind
 
